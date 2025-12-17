@@ -291,7 +291,7 @@ def _warn_deprecated_debug_setting():
 # Версия приложения
 # ==================================================================================================
 
-APP_VERSION: str = "1.0.4"
+APP_VERSION: str = "1.0.5"
 APP_TITLE: str = "Kiro API Gateway"
 APP_DESCRIPTION: str = "OpenAI-compatible interface for Kiro API (AWS CodeWhisperer). Made by @jwadow"
 
