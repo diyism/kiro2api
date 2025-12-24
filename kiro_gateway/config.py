@@ -148,6 +148,7 @@ MODEL_MAPPING: Dict[str, str] = {
     
     # Claude Haiku 4.5 - fast model
     "claude-haiku-4-5": "claude-haiku-4.5",
+    "claude-haiku-4-5-20251001": "claude-haiku-4.5",
     "claude-haiku-4.5": "claude-haiku-4.5",  # Direct passthrough
     
     # Claude Sonnet 4.5 - enhanced model
@@ -171,6 +172,7 @@ AVAILABLE_MODELS: List[str] = [
     "claude-opus-4-5",
     "claude-opus-4-5-20251101",
     "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-20250929",
     "claude-sonnet-4",
