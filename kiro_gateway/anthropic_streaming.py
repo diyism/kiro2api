@@ -201,7 +201,7 @@ async def stream_kiro_to_anthropic(
         # Get tool calls from parser (Kiro sends them as toolUseEvent)
         parser_tool_calls = parser.get_tool_calls()
         if parser_tool_calls:
-            logger.debug(f"[Anthropic Streaming] Found {len(parser_tool_calls)} tool calls from parser")
+            # logger.debug(f"[Anthropic Streaming] Found {len(parser_tool_calls)} tool calls from parser")
             for tool_call in parser_tool_calls:
                 # Convert from OpenAI format to Anthropic format
                 try:
@@ -354,7 +354,7 @@ async def collect_anthropic_response(
         # Get tool calls from parser (from toolUseEvent events)
         parser_tool_calls = parser.get_tool_calls()
         if parser_tool_calls:
-            logger.debug(f"[Anthropic Collect] Found {len(parser_tool_calls)} tool calls from parser")
+            # logger.debug(f"[Anthropic Collect] Found {len(parser_tool_calls)} tool calls from parser")
             for tc in parser_tool_calls:
                 # Convert from OpenAI format to Anthropic format
                 tool_use_id = f"toolu_{generate_completion_id()}"

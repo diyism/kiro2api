@@ -180,7 +180,7 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
             
             # Предпочитаем непустые аргументы
             if current_args != "{}" and (existing_args == "{}" or len(current_args) > len(existing_args)):
-                logger.debug(f"Replacing tool call {tc_id} with better arguments: {len(existing_args)} -> {len(current_args)}")
+                # logger.debug(f"Replacing tool call {tc_id} with better arguments: {len(existing_args)} -> {len(current_args)}")
                 by_id[tc_id] = tc
     
     # Собираем tool calls: сначала те что с id, потом без id
@@ -200,10 +200,10 @@ def deduplicate_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, A
         if key not in seen:
             seen.add(key)
             unique.append(tc)
-    
+
     if len(tool_calls) != len(unique):
-        logger.debug(f"Deduplicated tool calls: {len(tool_calls)} -> {len(unique)}")
-    
+        pass  # logger.debug(f"Deduplicated tool calls: {len(tool_calls)} -> {len(unique)}")
+
     return unique
 
 
@@ -399,16 +399,16 @@ class AwsEventStreamParser:
         # Пытаемся распарсить и нормализовать arguments как JSON
         args = self.current_tool_call['function']['arguments']
         tool_name = self.current_tool_call['function'].get('name', 'unknown')
-        
-        logger.debug(f"Finalizing tool call '{tool_name}' with raw arguments: {repr(args)[:200]}")
-        
+
+        # logger.debug(f"Finalizing tool call '{tool_name}' with raw arguments: {repr(args)[:200]}")
+
         if isinstance(args, str):
             if args.strip():
                 try:
                     parsed = json.loads(args)
                     # Убеждаемся что результат - строка JSON
                     self.current_tool_call['function']['arguments'] = json.dumps(parsed)
-                    logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
+                    # logger.debug(f"Tool '{tool_name}' arguments parsed successfully: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)}")
                 except json.JSONDecodeError as e:
                     # Если не удалось распарсить, оставляем пустой объект
                     logger.warning(f"Failed to parse tool '{tool_name}' arguments: {e}. Raw: {args[:200]}")
@@ -416,12 +416,12 @@ class AwsEventStreamParser:
             else:
                 # Пустая строка - используем пустой объект
                 # Это нормальное поведение для дубликатов tool calls от Kiro
-                logger.debug(f"Tool '{tool_name}' has empty arguments string (will be deduplicated)")
+                # logger.debug(f"Tool '{tool_name}' has empty arguments string (will be deduplicated)")
                 self.current_tool_call['function']['arguments'] = "{}"
         elif isinstance(args, dict):
             # Если уже объект - сериализуем в строку
             self.current_tool_call['function']['arguments'] = json.dumps(args)
-            logger.debug(f"Tool '{tool_name}' arguments already dict with keys: {list(args.keys())}")
+            # logger.debug(f"Tool '{tool_name}' arguments already dict with keys: {list(args.keys())}")
         else:
             # Неизвестный тип - пустой объект
             logger.warning(f"Tool '{tool_name}' has unexpected arguments type: {type(args)}")
