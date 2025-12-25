@@ -331,33 +331,12 @@ async def collect_anthropic_response(
             # Parse AWS event stream - feed returns a list of events
             events = parser.feed(chunk)
 
-            # # Debug: log received events
-            # if events:
-            #     logger.debug(f"[Anthropic Collect] Received {len(events)} events")
-            #     for evt in events:
-            #         logger.debug(f"[Anthropic Collect] Event: {evt}")
-
             for event in events:
                 event_type = event.get("type")
 
                 if event_type == "content":
                     content = event.get("data", "")
-
-                    # Check for tool calls
-                    tool_calls = parse_bracket_tool_calls(content)
-
-                    if tool_calls:
-                        for tc in tool_calls:
-                            tool_use_id = f"toolu_{int(time.time() * 1000)}_{len(content_blocks)}"
-                            content_blocks.append({
-                                "type": "tool_use",
-                                "id": tool_use_id,
-                                "name": tc.get("name", ""),
-                                "input": tc.get("arguments", {})
-                            })
-                        stop_reason = "tool_use"
-                    else:
-                        accumulated_text += content
+                    accumulated_text += content
 
                 elif event_type == "metadata":
                     metadata = event.get("metadata", {})
@@ -367,10 +346,25 @@ async def collect_anthropic_response(
 
         # Add text content if any
         if accumulated_text:
-            content_blocks.insert(0, {
+            content_blocks.append({
                 "type": "text",
                 "text": accumulated_text
             })
+
+        # Get tool calls from parser (from toolUseEvent events)
+        parser_tool_calls = parser.get_tool_calls()
+        if parser_tool_calls:
+            logger.debug(f"[Anthropic Collect] Found {len(parser_tool_calls)} tool calls from parser")
+            for tc in parser_tool_calls:
+                # Convert from OpenAI format to Anthropic format
+                tool_use_id = f"toolu_{generate_completion_id()}"
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": tc.get("function", {}).get("name", ""),
+                    "input": json.loads(tc.get("function", {}).get("arguments", "{}"))
+                })
+            stop_reason = "tool_use"
 
         # Build response
         return {
