@@ -520,7 +520,8 @@ async def anthropic_messages(request: Request, request_data: AnthropicMessagesRe
                         http_client.client,
                         response,
                         request_data.model,
-                        request_id
+                        request_id,
+                        debug_logger
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -556,7 +557,8 @@ async def anthropic_messages(request: Request, request_data: AnthropicMessagesRe
                 http_client.client,
                 response,
                 request_data.model,
-                request_id
+                request_id,
+                debug_logger
             )
 
             await http_client.close()

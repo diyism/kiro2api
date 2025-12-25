@@ -38,7 +38,8 @@ async def stream_kiro_to_anthropic(
     client: httpx.AsyncClient,
     response: httpx.Response,
     model: str,
-    request_id: Optional[str] = None
+    request_id: Optional[str] = None,
+    debug_logger = None
 ) -> AsyncGenerator[str, None]:
     """
     Convert Kiro SSE stream to Anthropic Messages API streaming format.
@@ -48,6 +49,7 @@ async def stream_kiro_to_anthropic(
         response: HTTP response with SSE stream
         model: Model name
         request_id: Optional request ID (generated if not provided)
+        debug_logger: Optional debug logger instance
 
     Yields:
         SSE formatted strings for Anthropic streaming events
@@ -68,6 +70,10 @@ async def stream_kiro_to_anthropic(
         async for chunk in response.aiter_bytes():
             if not chunk:
                 continue
+
+            # Log raw chunk for debugging
+            if debug_logger:
+                debug_logger.log_raw_chunk(chunk)
 
             # Parse AWS event stream - feed returns a list of events
             events = parser.feed(chunk)
@@ -103,7 +109,10 @@ async def stream_kiro_to_anthropic(
                                 }
                             }
                         }
-                        yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                        chunk_text = f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                        if debug_logger:
+                            debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                        yield chunk_text
                         message_started = True
 
                     # Check for tool calls in content
@@ -150,7 +159,10 @@ async def stream_kiro_to_anthropic(
                                         "text": ""
                                     }
                                 }
-                                yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                                chunk_text = f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                                if debug_logger:
+                                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                                yield chunk_text
 
                             # Send content_block_delta
                             delta = {
@@ -161,7 +173,10 @@ async def stream_kiro_to_anthropic(
                                     "text": content
                                 }
                             }
-                            yield f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            chunk_text = f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n"
+                            if debug_logger:
+                                debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                            yield chunk_text
 
                             accumulated_text += content
 
@@ -178,7 +193,56 @@ async def stream_kiro_to_anthropic(
                 "type": "content_block_stop",
                 "index": 0
             }
-            yield f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n"
+            chunk_text = f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n"
+            if debug_logger:
+                debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+            yield chunk_text
+
+        # Get tool calls from parser (Kiro sends them as toolUseEvent)
+        parser_tool_calls = parser.get_tool_calls()
+        if parser_tool_calls:
+            logger.debug(f"[Anthropic Streaming] Found {len(parser_tool_calls)} tool calls from parser")
+            for tool_call in parser_tool_calls:
+                # Convert from OpenAI format to Anthropic format
+                try:
+                    arguments = tool_call.get('function', {}).get('arguments', '{}')
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Failed to parse tool arguments: {arguments}")
+                    arguments = {}
+
+                tool_use_id = f"toolu_{int(time.time() * 1000)}_{current_tool_index}"
+                tool_use = {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": tool_call.get('function', {}).get('name', ''),
+                    "input": arguments
+                }
+                tool_uses.append(tool_use)
+
+                # Send content_block_start
+                block_start = {
+                    "type": "content_block_start",
+                    "index": current_tool_index + (1 if accumulated_text else 0),
+                    "content_block": tool_use
+                }
+                chunk_text = f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                if debug_logger:
+                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                yield chunk_text
+
+                # Send content_block_stop
+                block_stop = {
+                    "type": "content_block_stop",
+                    "index": current_tool_index + (1 if accumulated_text else 0)
+                }
+                chunk_text = f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n"
+                if debug_logger:
+                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                yield chunk_text
+
+                current_tool_index += 1
 
         # Determine stop reason
         if tool_uses:
@@ -197,13 +261,19 @@ async def stream_kiro_to_anthropic(
                 "output_tokens": output_tokens
             }
         }
-        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+        chunk_text = f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+        if debug_logger:
+            debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+        yield chunk_text
 
         # Send message_stop
         message_stop = {
             "type": "message_stop"
         }
-        yield f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+        chunk_text = f"event: message_stop\ndata: {json.dumps(message_stop)}\n\n"
+        if debug_logger:
+            debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+        yield chunk_text
 
     except Exception as e:
         logger.error(f"Error in Anthropic streaming: {e}", exc_info=True)
@@ -223,7 +293,8 @@ async def collect_anthropic_response(
     client: httpx.AsyncClient,
     response: httpx.Response,
     model: str,
-    request_id: Optional[str] = None
+    request_id: Optional[str] = None,
+    debug_logger = None
 ) -> Dict[str, Any]:
     """
     Collect complete Anthropic response from Kiro stream.
@@ -233,6 +304,7 @@ async def collect_anthropic_response(
         response: HTTP response with SSE stream
         model: Model name
         request_id: Optional request ID
+        debug_logger: Optional debug logger instance
 
     Returns:
         Complete Anthropic Messages API response
@@ -251,6 +323,10 @@ async def collect_anthropic_response(
         async for chunk in response.aiter_bytes():
             if not chunk:
                 continue
+
+            # Log raw chunk for debugging
+            if debug_logger:
+                debug_logger.log_raw_chunk(chunk)
 
             # Parse AWS event stream - feed returns a list of events
             events = parser.feed(chunk)

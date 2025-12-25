@@ -63,16 +63,19 @@ class DebugLogger:
             return
         self.debug_dir = Path(DEBUG_DIR)
         self._initialized = True
-        
+
         # Буферы для режима "errors"
         self._request_body_buffer: Optional[bytes] = None
         self._kiro_request_body_buffer: Optional[bytes] = None
         self._raw_chunks_buffer: bytearray = bytearray()
         self._modified_chunks_buffer: bytearray = bytearray()
-        
+
         # Буфер для логов приложения (loguru)
         self._app_logs_buffer: io.StringIO = io.StringIO()
         self._loguru_sink_id: Optional[int] = None
+
+        # Временная метка для текущего запроса
+        self._request_timestamp: str = ""
     
     def _is_enabled(self) -> bool:
         """Проверяет, включено ли логирование."""
@@ -128,27 +131,29 @@ class DebugLogger:
     def prepare_new_request(self):
         """
         Подготавливает логгер для нового запроса.
-        
-        В режиме "all": очищает папку с логами.
+
+        В режиме "all": НЕ очищает папку (сохраняет все запросы с временными метками).
         В режиме "errors": очищает буферы.
         В обоих режимах: настраивает захват логов приложения.
         """
         if not self._is_enabled():
             return
-        
+
+        # Генерируем временную метку для этого запроса
+        from datetime import datetime
+        self._request_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
         # Очищаем буферы в любом случае
         self._clear_buffers()
-        
+
         # Настраиваем захват логов приложения
         self._setup_app_logs_capture()
 
         if self._is_immediate_write():
-            # Режим "all" - очищаем папку и создаём заново
+            # Режим "all" - НЕ очищаем папку, просто создаём если не существует
             try:
-                if self.debug_dir.exists():
-                    shutil.rmtree(self.debug_dir)
                 self.debug_dir.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"[DebugLogger] Directory {self.debug_dir} cleared for new request.")
+                logger.debug(f"[DebugLogger] Directory {self.debug_dir} ready for new request (timestamp={self._request_timestamp}).")
             except Exception as e:
                 logger.error(f"[DebugLogger] Error preparing directory: {e}")
 
@@ -333,7 +338,7 @@ class DebugLogger:
     def _write_request_body_to_file(self, body: bytes):
         """Записывает тело запроса в файл."""
         try:
-            file_path = self.debug_dir / "request_body.json"
+            file_path = self.debug_dir / f"{self._request_timestamp}_request_body.json"
             try:
                 json_obj = json.loads(body)
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -343,11 +348,11 @@ class DebugLogger:
                     f.write(body)
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing request_body: {e}")
-    
+
     def _write_kiro_request_body_to_file(self, body: bytes):
         """Записывает тело запроса к Kiro в файл."""
         try:
-            file_path = self.debug_dir / "kiro_request_body.json"
+            file_path = self.debug_dir / f"{self._request_timestamp}_kiro_request_body.json"
             try:
                 json_obj = json.loads(body)
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -357,11 +362,11 @@ class DebugLogger:
                     f.write(body)
         except Exception as e:
             logger.error(f"[DebugLogger] Error writing kiro_request_body: {e}")
-    
+
     def _append_raw_chunk_to_file(self, chunk: bytes):
         """Дописывает сырой чанк в файл."""
         try:
-            file_path = self.debug_dir / "response_stream_raw.txt"
+            file_path = self.debug_dir / f"{self._request_timestamp}_response_stream_raw.txt"
             with open(file_path, "ab") as f:
                 f.write(chunk)
         except Exception:
@@ -370,28 +375,28 @@ class DebugLogger:
     def _append_modified_chunk_to_file(self, chunk: bytes):
         """Дописывает модифицированный чанк в файл."""
         try:
-            file_path = self.debug_dir / "response_stream_modified.txt"
+            file_path = self.debug_dir / f"{self._request_timestamp}_response_stream_modified.txt"
             with open(file_path, "ab") as f:
                 f.write(chunk)
         except Exception:
             pass
-    
+
     def _write_app_logs_to_file(self):
         """Записывает захваченные логи приложения в файл."""
         try:
             # Получаем содержимое буфера
             logs_content = self._app_logs_buffer.getvalue()
-            
+
             if not logs_content.strip():
                 return
-            
+
             # Убеждаемся что директория существует
             self.debug_dir.mkdir(parents=True, exist_ok=True)
-            
-            file_path = self.debug_dir / "app_logs.txt"
+
+            file_path = self.debug_dir / f"{self._request_timestamp}_app_logs.txt"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(logs_content)
-            
+
             logger.debug(f"[DebugLogger] App logs saved to {file_path}")
         except Exception as e:
             # Не логируем ошибку через logger чтобы избежать рекурсии
