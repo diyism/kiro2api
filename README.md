@@ -1,3 +1,6 @@
+    更换用完额度的帐号时:
+    $ rm ~/.aws/sso/cache/kiro-auth-token.json
+
 <div align="center">
 
 # 🚀 Kiro OpenAI Gateway
