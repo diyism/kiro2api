@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Kiro OpenAI Gateway
-# https://github.com/jwadow/kiro-openai-gateway
+# Kiro Gateway
+# https://github.com/jwadow/kiro-gateway
 # Copyright (C) 2025 Jwadow
 #
 # This program is free software: you can redistribute it and/or modify
@@ -24,9 +24,10 @@ Contains generators for:
 - Converting AWS SSE to OpenAI SSE
 - Forming streaming chunks
 - Processing tool calls in stream
+
+Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 """
 
-import asyncio
 import json
 import time
 from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
@@ -35,25 +36,37 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro_gateway.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
-from kiro_gateway.utils import generate_completion_id
-from kiro_gateway.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES
-from kiro_gateway.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.utils import generate_completion_id
+from kiro.config import (
+    FIRST_TOKEN_TIMEOUT,
+    FIRST_TOKEN_MAX_RETRIES,
+    FAKE_REASONING_HANDLING,
+)
+from kiro.tokenizer import count_tokens, count_message_tokens, count_tools_tokens
+
+# Import from streaming_core - reuse shared parsing logic
+from kiro.streaming_core import (
+    parse_kiro_stream,
+    FirstTokenTimeoutError,
+    KiroEvent,
+    calculate_tokens_from_context_usage,
+    stream_with_first_token_retry as stream_with_first_token_retry_core,
+)
 
 if TYPE_CHECKING:
-    from kiro_gateway.auth import KiroAuthManager
-    from kiro_gateway.cache import ModelInfoCache
+    from kiro.auth import KiroAuthManager
+    from kiro.cache import ModelInfoCache
 
 # Import debug_logger for logging
 try:
-    from kiro_gateway.debug_logger import debug_logger
+    from kiro.debug_logger import debug_logger
 except ImportError:
     debug_logger = None
 
 
-class FirstTokenTimeoutError(Exception):
-    """Exception raised when first token timeout occurs."""
-    pass
+# Re-export FirstTokenTimeoutError for backward compatibility
+__all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
 
 
 async def stream_kiro_to_openai_internal(
@@ -101,50 +114,25 @@ async def stream_kiro_to_openai_internal(
     completion_id = generate_completion_id()
     created_time = int(time.time())
     first_chunk = True
-    first_token_received = False
     
-    parser = AwsEventStreamParser()
     metering_data = None
     context_usage_percentage = None
     full_content = ""
+    full_thinking_content = ""  # Accumulated thinking content for non-streaming
     
     streaming_error_occurred = False
+    tool_calls_from_stream = []
     
     try:
-        # Create iterator for reading bytes
-        byte_iterator = response.aiter_bytes()
-        
-        # Wait for first chunk with timeout (FIRST_TOKEN_TIMEOUT)
-        # This is our business logic for detecting "stuck" requests
-        # where the model takes too long to start responding
-        try:
-            logger.debug(f"Waiting for first token (timeout={first_token_timeout}s)...")
-            first_byte_chunk = await asyncio.wait_for(
-                byte_iterator.__anext__(),
-                timeout=first_token_timeout
-            )
-            logger.debug("First token received")
-        except asyncio.TimeoutError:
-            logger.warning(f"[FirstTokenTimeout] Model did not respond within {first_token_timeout}s")
-            raise FirstTokenTimeoutError(f"No response within {first_token_timeout} seconds")
-        except StopAsyncIteration:
-            # Empty response - this is normal, just finish
-            logger.debug("Empty response from Kiro API")
-            yield "data: [DONE]\n\n"
-            return
-        
-        # Process first chunk
-        if debug_logger:
-            debug_logger.log_raw_chunk(first_byte_chunk)
-        
-        events = parser.feed(first_byte_chunk)
-        for event in events:
-            if event["type"] == "content":
-                first_token_received = True
-                content = event["data"]
-                full_content += content
+        # Use streaming_core.parse_kiro_stream for unified event parsing
+        # This handles AWS SSE parsing, first token timeout, and thinking parser
+        async for event in parse_kiro_stream(response, first_token_timeout):
+            if event.type == "content" and event.content:
+                # Accumulate content for bracket tool call detection
+                full_content += event.content
                 
-                delta = {"content": content}
+                # Format as OpenAI chunk
+                delta = {"content": event.content}
                 if first_chunk:
                     delta["role"] = "assistant"
                     first_chunk = False
@@ -164,88 +152,68 @@ async def stream_kiro_to_openai_internal(
                 
                 yield chunk_text
             
-            elif event["type"] == "usage":
-                metering_data = event["data"]
-            
-            elif event["type"] == "context_usage":
-                context_usage_percentage = event["data"]
-        
-        # Continue reading remaining chunks (no longer with first token timeout)
-        async for chunk in byte_iterator:
-            # Log raw chunk
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
-            
-            events = parser.feed(chunk)
-            
-            for event in events:
-                if event["type"] == "content":
-                    content = event["data"]
-                    full_content += content
-                    
-                    # Form delta
-                    delta = {"content": content}
-                    if first_chunk:
-                        delta["role"] = "assistant"
-                        first_chunk = False
-                    
-                    # Form OpenAI chunk
-                    openai_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
-                    }
-                    
-                    chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                    
-                    # Log modified chunk
-                    if debug_logger:
-                        debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                    
-                    yield chunk_text
+            elif event.type == "thinking" and event.thinking_content:
+                # Accumulate thinking content
+                full_thinking_content += event.thinking_content
                 
-                elif event["type"] == "usage":
-                    metering_data = event["data"]
+                # Send as reasoning_content or content based on mode
+                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                    delta = {"reasoning_content": event.thinking_content}
+                else:
+                    delta = {"content": event.thinking_content}
                 
-                elif event["type"] == "context_usage":
-                    context_usage_percentage = event["data"]
+                if first_chunk:
+                    delta["role"] = "assistant"
+                    first_chunk = False
+                
+                openai_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                }
+                
+                chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
+                
+                if debug_logger:
+                    debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
+                
+                yield chunk_text
+            
+            elif event.type == "tool_use" and event.tool_use:
+                # Collect tool calls from stream
+                tool_calls_from_stream.append(event.tool_use)
+            
+            elif event.type == "usage" and event.usage:
+                metering_data = event.usage
+            
+            elif event.type == "context_usage" and event.context_usage_percentage is not None:
+                context_usage_percentage = event.context_usage_percentage
         
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        all_tool_calls = parser.get_tool_calls() + bracket_tool_calls
+        all_tool_calls = tool_calls_from_stream + bracket_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
         
         # Determine finish_reason
         finish_reason = "tool_calls" if all_tool_calls else "stop"
         
         # Count completion_tokens (output) using tiktoken
-        completion_tokens = count_tokens(full_content)
+        completion_tokens = count_tokens(full_content + full_thinking_content)
         
         # Calculate total_tokens based on context_usage_percentage from Kiro API
         # context_usage shows TOTAL percentage of context usage (input + output)
-        total_tokens_from_api = 0
-        if context_usage_percentage is not None and context_usage_percentage > 0:
-            max_input_tokens = model_cache.get_max_input_tokens(model)
-            total_tokens_from_api = int((context_usage_percentage / 100) * max_input_tokens)
+        prompt_tokens, total_tokens, prompt_source, total_source = calculate_tokens_from_context_usage(
+            context_usage_percentage, completion_tokens, model_cache, model
+        )
         
-        # Determine data source and calculate tokens
-        if total_tokens_from_api > 0:
-            # Use data from Kiro API
-            # prompt_tokens (input) = total_tokens - completion_tokens
-            prompt_tokens = max(0, total_tokens_from_api - completion_tokens)
-            total_tokens = total_tokens_from_api
-            prompt_source = "subtraction"
-            total_source = "API Kiro"
-        else:
-            # Fallback: Kiro API didn't return context_usage, use tiktoken
-            # Count prompt_tokens from original messages
-            # IMPORTANT: Don't apply correction coefficient for prompt_tokens,
-            # as it was calibrated for completion_tokens
-            prompt_tokens = 0
-            if request_messages:
-                prompt_tokens += count_message_tokens(request_messages, apply_claude_correction=False)
+        # Fallback: Kiro API didn't return context_usage, use tiktoken
+        # Count prompt_tokens from original messages
+        # IMPORTANT: Don't apply correction coefficient for prompt_tokens,
+        # as it was calibrated for completion_tokens
+        if prompt_source == "unknown" and request_messages:
+            prompt_tokens = count_message_tokens(request_messages, apply_claude_correction=False)
             if request_tools:
                 prompt_tokens += count_tools_tokens(request_tools, apply_claude_correction=False)
             total_tokens = prompt_tokens + completion_tokens
@@ -336,7 +304,7 @@ async def stream_kiro_to_openai_internal(
             f"Error during streaming: [{error_type}] {error_msg}",
             exc_info=True
         )
-        # Propagate error up for proper handling in routes.py
+        # Propagate error up for proper handling in routes_openai.py
         raise
     finally:
         # Always close response
@@ -406,6 +374,8 @@ async def stream_with_first_token_retry(
     This is seamless for user - they just see a delay,
     but eventually get a response (or error after all attempts).
     
+    Uses generic stream_with_first_token_retry from streaming_core.py.
+    
     Args:
         make_request: Function to create new HTTP request
         client: HTTP client
@@ -429,88 +399,43 @@ async def stream_with_first_token_retry(
         >>> async for chunk in stream_with_first_token_retry(make_req, client, model, cache, auth):
         ...     print(chunk)
     """
-    last_error: Optional[Exception] = None
+    def create_http_error(status_code: int, error_text: str) -> HTTPException:
+        """Create HTTPException for HTTP errors."""
+        return HTTPException(
+            status_code=status_code,
+            detail=f"Upstream API error: {error_text}"
+        )
     
-    for attempt in range(max_retries):
-        response: Optional[httpx.Response] = None
-        try:
-            # Make request
-            if attempt > 0:
-                logger.warning(f"Retry attempt {attempt + 1}/{max_retries} after first token timeout")
-            
-            response = await make_request()
-            
-            if response.status_code != 200:
-                # Error from API - close response and raise exception
-                try:
-                    error_content = await response.aread()
-                    error_text = error_content.decode('utf-8', errors='replace')
-                except Exception:
-                    error_text = "Unknown error"
-                
-                try:
-                    await response.aclose()
-                except Exception:
-                    pass
-                
-                logger.error(f"Error from Kiro API: {response.status_code} - {error_text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Upstream API error: {error_text}"
-                )
-            
-            # Try to stream with first token timeout
-            async for chunk in stream_kiro_to_openai_internal(
-                client,
-                response,
-                model,
-                model_cache,
-                auth_manager,
-                first_token_timeout=first_token_timeout,
-                request_messages=request_messages,
-                request_tools=request_tools
-            ):
-                yield chunk
-            
-            # Successfully completed - exit
-            return
-            
-        except FirstTokenTimeoutError as e:
-            last_error = e
-            logger.warning(
-                f"[FirstTokenTimeout] Attempt {attempt + 1}/{max_retries} failed - "
-                f"model did not respond within {first_token_timeout}s"
-            )
-            
-            # Close current response if open
-            if response:
-                try:
-                    await response.aclose()
-                except Exception:
-                    pass
-            
-            # Continue to next attempt
-            continue
-            
-        except Exception as e:
-            # Other errors - no retry, propagate
-            logger.error(f"Unexpected error during streaming: {e}", exc_info=True)
-            if response:
-                try:
-                    await response.aclose()
-                except Exception:
-                    pass
-            raise
+    def create_timeout_error(retries: int, timeout: float) -> HTTPException:
+        """Create HTTPException for timeout errors."""
+        return HTTPException(
+            status_code=504,
+            detail=f"Model did not respond within {timeout}s after {retries} attempts. Please try again."
+        )
     
-    # All attempts exhausted - raise HTTP error
-    logger.error(
-        f"[FirstTokenTimeout] All {max_retries} attempts exhausted - "
-        f"model never responded within {first_token_timeout}s per attempt"
-    )
-    raise HTTPException(
-        status_code=504,
-        detail=f"Model did not respond within {first_token_timeout}s after {max_retries} attempts. Please try again."
-    )
+    async def stream_processor(response: httpx.Response) -> AsyncGenerator[str, None]:
+        """Process response and yield OpenAI SSE chunks."""
+        async for chunk in stream_kiro_to_openai_internal(
+            client,
+            response,
+            model,
+            model_cache,
+            auth_manager,
+            first_token_timeout=first_token_timeout,
+            request_messages=request_messages,
+            request_tools=request_tools
+        ):
+            yield chunk
+    
+    async for chunk in stream_with_first_token_retry_core(
+        make_request=make_request,
+        stream_processor=stream_processor,
+        max_retries=max_retries,
+        first_token_timeout=first_token_timeout,
+        on_http_error=create_http_error,
+        on_all_retries_failed=create_timeout_error,
+    ):
+        yield chunk
 
 
 async def collect_stream_response(
@@ -541,6 +466,7 @@ async def collect_stream_response(
         Dictionary with full response in OpenAI chat.completion format
     """
     full_content = ""
+    full_reasoning_content = ""
     final_usage = None
     tool_calls = []
     completion_id = generate_completion_id()
@@ -568,6 +494,8 @@ async def collect_stream_response(
             delta = chunk_data.get("choices", [{}])[0].get("delta", {})
             if "content" in delta:
                 full_content += delta["content"]
+            if "reasoning_content" in delta:
+                full_reasoning_content += delta["reasoning_content"]
             if "tool_calls" in delta:
                 tool_calls.extend(delta["tool_calls"])
             
@@ -580,6 +508,8 @@ async def collect_stream_response(
     
     # Form final response
     message = {"role": "assistant", "content": full_content}
+    if full_reasoning_content:
+        message["reasoning_content"] = full_reasoning_content
     if tool_calls:
         # For non-streaming response remove index field from tool_calls,
         # as it's only required for streaming chunks

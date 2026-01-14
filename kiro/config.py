@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Kiro OpenAI Gateway
-# https://github.com/jwadow/kiro-openai-gateway
+# Kiro Gateway
+# https://github.com/jwadow/kiro-gateway
 # Copyright (C) 2025 Jwadow
 #
 # This program is free software: you can redistribute it and/or modify
@@ -77,11 +77,26 @@ def _get_raw_env_value(var_name: str, env_file: str = ".env") -> Optional[str]:
     return None
 
 # ==================================================================================================
+# Server Settings
+# ==================================================================================================
+
+# Server host (default: 0.0.0.0 - listen on all interfaces)
+# Use "127.0.0.1" to only allow local connections
+DEFAULT_SERVER_HOST: str = "0.0.0.0"
+SERVER_HOST: str = os.getenv("SERVER_HOST", DEFAULT_SERVER_HOST)
+
+# Server port (default: 8000)
+# Can be overridden by CLI: python main.py --port 9000
+# Or by uvicorn directly: uvicorn main:app --port 9000
+DEFAULT_SERVER_PORT: int = 8000
+SERVER_PORT: int = int(os.getenv("SERVER_PORT", str(DEFAULT_SERVER_PORT)))
+
+# ==================================================================================================
 # Proxy Server Settings
 # ==================================================================================================
 
 # API key for proxy access (clients must pass it in Authorization header)
-PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "changeme_proxy_secret")
+PROXY_API_KEY: str = os.getenv("PROXY_API_KEY", "my-super-secret-password-123")
 
 # ==================================================================================================
 # Kiro API Credentials
@@ -103,12 +118,21 @@ _raw_creds_file = _get_raw_env_value("KIRO_CREDS_FILE") or os.getenv("KIRO_CREDS
 # Normalize path for cross-platform compatibility
 KIRO_CREDS_FILE: str = str(Path(_raw_creds_file)) if _raw_creds_file else ""
 
+# Path to kiro-cli SQLite database (optional, for AWS SSO OIDC authentication)
+# Default location: ~/.local/share/kiro-cli/data.sqlite3 (Linux/macOS)
+# or ~/.local/share/amazon-q/data.sqlite3 (amazon-q-developer-cli)
+_raw_cli_db_file = _get_raw_env_value("KIRO_CLI_DB_FILE") or os.getenv("KIRO_CLI_DB_FILE", "")
+KIRO_CLI_DB_FILE: str = str(Path(_raw_cli_db_file)) if _raw_cli_db_file else ""
+
 # ==================================================================================================
 # Kiro API URL Templates
 # ==================================================================================================
 
-# URL for token refresh
+# URL for token refresh (Kiro Desktop Auth)
 KIRO_REFRESH_URL_TEMPLATE: str = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
+
+# URL for token refresh (AWS SSO OIDC - used by kiro-cli)
+AWS_SSO_OIDC_URL_TEMPLATE: str = "https://oidc.{region}.amazonaws.com/token"
 
 # Host for main API (generateAssistantResponse)
 KIRO_API_HOST_TEMPLATE: str = "https://codewhisperer.{region}.amazonaws.com"
@@ -136,12 +160,19 @@ MAX_RETRIES: int = 3
 BASE_RETRY_DELAY: float = 1.0
 
 # ==================================================================================================
-# Model Mapping
+# Hidden Models Configuration
 # ==================================================================================================
 
-# External model names (OpenAI-compatible) -> internal Kiro IDs
-# Clients use external names, and we convert them to internal ones
-MODEL_MAPPING: Dict[str, str] = {
+# Hidden models - not returned by Kiro /ListAvailableModels API but still functional.
+# These ARE shown in our /v1/models endpoint!
+# Use dot format for consistency with API models.
+#
+# Format: "display_name" → "internal_kiro_id"
+# Display names use dots (e.g., "claude-3.7-sonnet") for consistency with Kiro API.
+#
+# Why "hidden"? These models work but are not advertised by Kiro's /ListAvailableModels.
+# We expose them to our users because they're useful.
+HIDDEN_MODELS: Dict[str, str] = {
     # Claude Opus 4.5 - top-tier model
     "claude-opus-4-5": "claude-opus-4.5",
     "claude-opus-4-5-20251101": "claude-opus-4.5",
@@ -194,21 +225,21 @@ DEFAULT_MAX_INPUT_TOKENS: int = 200000
 # Tool Description Handling (Kiro API Limitations)
 # ==================================================================================================
 
-# Kiro API возвращает ошибку 400 "Improperly formed request" при слишком длинных
-# описаниях инструментов в toolSpecification.description.
+# Kiro API returns 400 "Improperly formed request" error when tool descriptions
+# in toolSpecification.description are too long.
 #
-# Решение: Tool Documentation Reference Pattern
-# - Если description ≤ лимита → оставляем как есть
-# - Если description > лимита:
-#   * В toolSpecification.description → ссылка на system prompt:
+# Solution: Tool Documentation Reference Pattern
+# - If description ≤ limit → keep as is
+# - If description > limit:
+#   * In toolSpecification.description → reference to system prompt:
 #     "[Full documentation in system prompt under '## Tool: {name}']"
-#   * В system prompt добавляется секция "## Tool: {name}" с полным описанием
+#   * In system prompt, a section "## Tool: {name}" with full description is added
 #
-# Модель видит явную ссылку и точно понимает, где искать полную документацию.
+# The model sees an explicit reference and knows exactly where to find full documentation.
 
-# Максимальная длина description для tool в символах.
-# Описания длиннее этого лимита будут перенесены в system prompt.
-# Установите 0 для отключения (не рекомендуется - вызовет ошибки Kiro API).
+# Maximum length of tool description in characters.
+# Descriptions longer than this limit will be moved to system prompt.
+# Set to 0 to disable (not recommended - will cause Kiro API errors).
 TOOL_DESCRIPTION_MAX_LENGTH: int = int(os.getenv("TOOL_DESCRIPTION_MAX_LENGTH", "10000"))
 
 # ==================================================================================================
@@ -330,17 +361,71 @@ def _warn_timeout_configuration():
         print(warning_text, file=sys.stderr)
 
 # ==================================================================================================
+# Fake Reasoning Settings (Extended Thinking via Tag Injection)
+# ==================================================================================================
+
+# Enable fake reasoning - injects special tags into requests to enable model reasoning.
+# When enabled, the model will include its reasoning process in the response wrapped in tags.
+# The response is then parsed and converted to OpenAI-compatible reasoning_content format.
+#
+# WHY "FAKE"? This is NOT native extended thinking API support. Instead, we inject
+# <thinking_mode>enabled</thinking_mode> tags into the prompt, and the model responds
+# with <thinking>...</thinking> blocks that we parse and convert to reasoning_content.
+# It works great, but it's a hack - hence "fake" reasoning.
+#
+# Default: true (enabled) - provides premium experience out of the box
+_FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
+# Default is True - if env var is not set or empty, enable fake reasoning
+FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+
+# Maximum thinking length in tokens.
+# This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
+# Higher values allow for more detailed reasoning but increase response time and token usage.
+# Default: 4000 tokens
+FAKE_REASONING_MAX_TOKENS: int = int(os.getenv("FAKE_REASONING_MAX_TOKENS", "4000"))
+
+# How to handle the thinking block in responses:
+# - "as_reasoning_content": Extract to reasoning_content field (OpenAI-compatible, recommended)
+# - "remove": Remove thinking block completely, return only final answer
+# - "pass": Pass through as-is with original tags in content
+# - "strip_tags": Remove tags but keep thinking content in regular content
+#
+# Default: "as_reasoning_content"
+_FAKE_REASONING_HANDLING_RAW: str = os.getenv("FAKE_REASONING_HANDLING", "as_reasoning_content").lower()
+if _FAKE_REASONING_HANDLING_RAW in ("as_reasoning_content", "remove", "pass", "strip_tags"):
+    FAKE_REASONING_HANDLING: str = _FAKE_REASONING_HANDLING_RAW
+else:
+    FAKE_REASONING_HANDLING: str = "as_reasoning_content"
+
+# List of opening tags to detect thinking blocks.
+# The parser will look for any of these tags at the start of the response.
+# Order matters - first match wins.
+FAKE_REASONING_OPEN_TAGS: List[str] = ["<thinking>", "<think>", "<reasoning>", "<thought>"]
+
+# Maximum size of initial buffer for tag detection (characters).
+# If no thinking tag is found within this limit, content is treated as regular response.
+# Lower values = faster first token, but may miss tags with leading whitespace.
+# Default: 30 characters (enough for longest tag + some whitespace)
+FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_BUFFER_SIZE", "20"))
+
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 
-APP_VERSION: str = "1.0.7"
-APP_TITLE: str = "Kiro API Gateway"
+APP_VERSION: str = "2.0"
+APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "OpenAI-compatible interface for Kiro API (AWS CodeWhisperer). Made by @jwadow"
 
 
 def get_kiro_refresh_url(region: str) -> str:
-    """Return token refresh URL for the specified region."""
+    """Return Kiro Desktop Auth token refresh URL for the specified region."""
     return KIRO_REFRESH_URL_TEMPLATE.format(region=region)
+
+
+def get_aws_sso_oidc_url(region: str) -> str:
+    """Return AWS SSO OIDC token URL for the specified region."""
+    return AWS_SSO_OIDC_URL_TEMPLATE.format(region=region)
 
 
 def get_kiro_api_host(region: str) -> str:
@@ -352,15 +437,3 @@ def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
 
-
-def get_internal_model_id(external_model: str) -> str:
-    """
-    Convert external model name to internal Kiro ID.
-    
-    Args:
-        external_model: External model name (e.g., "claude-sonnet-4-5")
-    
-    Returns:
-        Internal model ID for Kiro API
-    """
-    return MODEL_MAPPING.get(external_model, external_model)

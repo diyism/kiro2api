@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Kiro OpenAI Gateway
-# https://github.com/jwadow/kiro-openai-gateway
+# Kiro Gateway
+# https://github.com/jwadow/kiro-gateway
 # Copyright (C) 2025 Jwadow
 #
 # This program is free software: you can redistribute it and/or modify
@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
-    from kiro_gateway.auth import KiroAuthManager
+    from kiro.auth import KiroAuthManager
 
 
 def get_machine_fingerprint() -> str:

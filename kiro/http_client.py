@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
-# Kiro OpenAI Gateway
-# https://github.com/jwadow/kiro-openai-gateway
+# Kiro Gateway
+# https://github.com/jwadow/kiro-gateway
 # Copyright (C) 2025 Jwadow
 #
 # This program is free software: you can redistribute it and/or modify
@@ -25,6 +25,9 @@ Handles:
 - 429: exponential backoff
 - 5xx: exponential backoff
 - Timeouts: exponential backoff
+
+Supports both per-request clients and shared application-level client
+with connection pooling for better resource management.
 """
 
 import asyncio
@@ -34,9 +37,9 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro_gateway.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
-from kiro_gateway.auth import KiroAuthManager
-from kiro_gateway.utils import get_kiro_headers
+from kiro.config import MAX_RETRIES, BASE_RETRY_DELAY, FIRST_TOKEN_MAX_RETRIES, STREAMING_READ_TIMEOUT
+from kiro.auth import KiroAuthManager
+from kiro.utils import get_kiro_headers
 
 
 class KiroHttpClient:
@@ -48,33 +51,54 @@ class KiroHttpClient:
     - 429: waits with exponential backoff
     - 5xx: waits with exponential backoff
     - Timeouts: waits with exponential backoff
+    
+    Supports two modes of operation:
+    1. Per-request client: Creates and owns its own httpx.AsyncClient
+    2. Shared client: Uses an application-level shared client (recommended)
+    
+    Using a shared client reduces memory usage and enables connection pooling,
+    which is especially important for handling concurrent requests.
+    
     Attributes:
         auth_manager: Authentication manager for obtaining tokens
-        client: httpx HTTP client
+        client: httpx HTTP client (owned or shared)
     
     Example:
+        >>> # Per-request client (legacy mode)
         >>> client = KiroHttpClient(auth_manager)
-        >>> response = await client.request_with_retry(
-        ...     "POST",
-        ...     "https://api.example.com/endpoint",
-        ...     {"data": "value"},
-        ...     stream=True
-        ... )
+        >>> response = await client.request_with_retry(...)
+        
+        >>> # Shared client (recommended)
+        >>> shared = httpx.AsyncClient(limits=httpx.Limits(...))
+        >>> client = KiroHttpClient(auth_manager, shared_client=shared)
+        >>> response = await client.request_with_retry(...)
     """
     
-    def __init__(self, auth_manager: KiroAuthManager):
+    def __init__(
+        self,
+        auth_manager: KiroAuthManager,
+        shared_client: Optional[httpx.AsyncClient] = None
+    ):
         """
         Initializes the HTTP client.
         
         Args:
             auth_manager: Authentication manager
+            shared_client: Optional shared httpx.AsyncClient for connection pooling.
+                          If provided, this client will be used instead of creating
+                          a new one. The shared client will NOT be closed by close().
         """
         self.auth_manager = auth_manager
-        self.client: Optional[httpx.AsyncClient] = None
+        self._shared_client = shared_client
+        self._owns_client = shared_client is None
+        self.client: Optional[httpx.AsyncClient] = shared_client
     
     async def _get_client(self, stream: bool = False) -> httpx.AsyncClient:
         """
         Returns or creates an HTTP client with proper timeouts.
+        
+        If a shared client was provided at initialization, it is returned as-is.
+        Otherwise, creates a new client with appropriate timeout configuration.
         
         httpx timeouts:
         - connect: TCP handshake (DNS + TCP SYN/ACK)
@@ -83,15 +107,21 @@ class KiroHttpClient:
         - pool: waiting for free connection from pool
         
         IMPORTANT: FIRST_TOKEN_TIMEOUT is NOT used here!
-        It is applied in streaming.py via asyncio.wait_for() to control
+        It is applied in streaming_openai.py via asyncio.wait_for() to control
         the wait time for the first token from the model (retry business logic).
         
         Args:
-            stream: If True, uses STREAMING_READ_TIMEOUT for read
+            stream: If True, uses STREAMING_READ_TIMEOUT for read (only for new clients)
         
         Returns:
             Active HTTP client
         """
+        # If using shared client, return it directly
+        # Shared client should be pre-configured with appropriate timeouts
+        if self._shared_client is not None:
+            return self._shared_client
+        
+        # Create new client if needed (per-request mode)
         if self.client is None or self.client.is_closed:
             if stream:
                 # For streaming:
@@ -114,9 +144,26 @@ class KiroHttpClient:
         return self.client
     
     async def close(self) -> None:
-        """Closes the HTTP client."""
+        """
+        Closes the HTTP client if this instance owns it.
+        
+        If using a shared client, this method does nothing - the shared client
+        should be closed by the application lifecycle manager.
+        
+        Uses graceful exception handling to prevent errors during cleanup
+        from masking the original exception in finally blocks.
+        """
+        # Don't close shared clients - they're managed by the application
+        if not self._owns_client:
+            return
+        
         if self.client and not self.client.is_closed:
-            await self.client.aclose()
+            try:
+                await self.client.aclose()
+            except Exception as e:
+                # Log but don't propagate - we're in cleanup code
+                # Propagating here could mask the original exception
+                logger.warning(f"Error closing HTTP client: {e}")
     
     async def request_with_retry(
         self,
@@ -135,7 +182,7 @@ class KiroHttpClient:
         - Timeouts: waits with exponential backoff
         
         For streaming, STREAMING_READ_TIMEOUT is used for waiting between chunks.
-        First token timeout is controlled separately in streaming.py via asyncio.wait_for().
+        First token timeout is controlled separately in streaming_openai.py via asyncio.wait_for().
         
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -150,11 +197,12 @@ class KiroHttpClient:
             HTTPException: On failure after all attempts (502/504)
         """
         # Determine the number of retry attempts
-        # FIRST_TOKEN_TIMEOUT is used in streaming.py, not here
+        # FIRST_TOKEN_TIMEOUT is used in streaming_openai.py, not here
         max_retries = FIRST_TOKEN_MAX_RETRIES if stream else MAX_RETRIES
         
         client = await self._get_client(stream=stream)
         last_error = None
+        last_status_code = None
         
         for attempt in range(max_retries):
             try:
@@ -174,12 +222,14 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
+                    last_status_code = 403
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
                 
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
+                    last_status_code = 429
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     await asyncio.sleep(delay)
@@ -187,6 +237,7 @@ class KiroHttpClient:
                 
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
+                    last_status_code = response.status_code
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     await asyncio.sleep(delay)
@@ -231,15 +282,16 @@ class KiroHttpClient:
                 await asyncio.sleep(delay)
         
         # All attempts exhausted
+        error_detail = f"HTTP {last_status_code}" if last_status_code else type(last_error).__name__
         if stream:
             raise HTTPException(
                 status_code=504,
-                detail=f"Streaming failed after {max_retries} attempts. Last error: {type(last_error).__name__}"
+                detail=f"Streaming failed after {max_retries} attempts. Last error: {error_detail}"
             )
         else:
             raise HTTPException(
                 status_code=502,
-                detail=f"Failed to complete request after {max_retries} attempts: {last_error}"
+                detail=f"Failed to complete request after {max_retries} attempts: {error_detail}"
             )
     
     async def __aenter__(self) -> "KiroHttpClient":
