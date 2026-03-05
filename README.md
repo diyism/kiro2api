@@ -1,8 +1,9 @@
     更换用完额度的帐号时:
     $ rm ~/.aws/sso/cache/kiro-auth-token.json
 
-    kiro-cli的登录信息在数据库里, 还是直接kiro-cli logout; kiro-cli login 在浏览器更换帐号更方便:
+    kiro-cli的登录信息在数据库里:
     $ sqlite3 ~/.local/share/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key = 'kirocli:social:token';"
+    $ rm ~/.local/share/kiro-cli/data.sqlite3
 
 <div align="center">
 
