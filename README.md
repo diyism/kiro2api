@@ -7,6 +7,23 @@
 
     kiro-gateway for codex app 在 https://github.com/diyism/kiro-gateway-for-codex
 
+    $ cd kiro-gateway-for-codex
+    $ python main.py
+    $ head -n 40  ~/.codex/config.toml
+    #model = "gpt-5.5"
+    #model_reasoning_effort = "medium"
+    
+    model_provider = "kiro"
+    model = "claude-sonnet-4-5"
+    
+    [model_providers.kiro]
+    name = "kiro"
+    base_url = "http://127.0.0.1:8001/v1"
+    env_key = "KIRO_KEY"
+
+    $ python provider_repair_gui.py       #modify sessions history to current provider and model in ~/.codex/config.toml
+    $ KIRO_KEY=... /usr/lib/codex/Codex
+
 <div align="center">
 
 # 🚀 Kiro OpenAI Gateway
