@@ -5,6 +5,8 @@
     $ sqlite3 ~/.local/share/kiro-cli/data.sqlite3 "SELECT value FROM auth_kv WHERE key = 'kirocli:social:token';"
     $ rm ~/.local/share/kiro-cli/data.sqlite3
 
+    kiro-gateway for codex app 在 https://github.com/diyism/kiro-gateway-for-codex
+
 <div align="center">
 
 # 🚀 Kiro OpenAI Gateway
